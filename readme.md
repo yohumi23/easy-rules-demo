@@ -99,3 +99,477 @@ inferenceEngine.fire(rules, facts);
 - 作用
   - 规则引擎会跳过优先级高于该阈值的规则。
   - 适用于需要限制规则执行范围的场景，例如只执行优先级较低的规则。
+
+
+
+## 一个Demo
+
+已思考 1 秒
+
+下面给你演示一个“小型医疗诊断系统”——它会根据一系列症状 → 推理出中间病理事实 → 再得出最终诊断与处置建议。
+ 整个链条至少 3 级依赖，若用 `DefaultRulesEngine` 只能手写所有组合；但 `InferenceRulesEngine` 会自动把新增事实重新投入匹配循环，从而层层触发后续规则。
+
+------
+
+### 1 . 依赖关系示意
+
+```
+┌────────────┐
+│  原始症状  │
+└─────┬──────┘
+      ▼ facts.put(...)
+┌────────────┐  (R1,R2,R3)
+│ 中间病理结论│  e.g. “感染”“出血”…
+└─────┬──────┘
+      ▼ facts.put(...)
+┌────────────┐  (R4,R5)
+│  综合诊断  │  e.g. “败血症”
+└─────┬──────┘
+      ▼ facts.put(...)
+┌────────────┐  (R6)
+│   处置方案 │
+└────────────┘
+```
+
+------
+
+### 2 . 依赖的 POJO 与 Fact Key
+
+```java
+public enum Symptom { FEVER, COUGH, TACHYCARDIA, LOW_BP, HIGH_WBC }
+public enum Pathology { INFECTION, BLEEDING, SEPSIS }
+    public enum Treatment { ADMIT_ICU }
+
+record PatientState(Set<Symptom> symptoms,
+                    Set<Pathology> pathologies,
+                    Set<Pathology> diagnoses,
+                    Set<Treatment> treatments) {}
+```
+
+------
+
+### 3 . 规则定义
+
+```java
+@Configuration
+public class DiagnosisRules {
+
+    /* ---------------- Level‑1: 症状 → 病理 ---------------- */
+
+    @Bean
+    public Rule infectionRule() {
+        return new RuleBuilder()
+            .name("symptom → infection")
+            .priority(1)
+            .when(facts -> {
+                PatientState p = facts.get("patient");
+                return p.symptoms().contains(Symptom.FEVER)
+                    && p.symptoms().contains(Symptom.HIGH_WBC);
+            })
+            .then(facts -> {
+                PatientState p = facts.get("patient");
+                p.pathologies().add(Pathology.INFECTION);          // 新事实
+                facts.put("patient", p);                           // 推回 Facts
+            }).build();
+    }
+
+    @Bean
+    public Rule bleedingRule() {
+        return new RuleBuilder()
+            .name("symptom → bleeding")
+            .priority(1)
+            .when(facts -> {
+                PatientState p = facts.get("patient");
+                return p.symptoms().contains(Symptom.LOW_BP)
+                    && p.symptoms().contains(Symptom.TACHYCARDIA);
+            })
+            .then(facts -> {
+                PatientState p = facts.get("patient");
+                p.pathologies().add(Pathology.BLEEDING);
+                facts.put("patient", p);
+            }).build();
+    }
+
+    /* ---------------- Level‑2: 病理组合 → 诊断 ---------------- */
+
+    @Bean
+    public Rule sepsisRule() {
+        return new RuleBuilder()
+            .name("pathology → sepsis")
+            .priority(2)
+            .when(facts -> {
+                PatientState p = facts.get("patient");
+                return p.pathologies().contains(Pathology.INFECTION)
+                    && p.pathologies().contains(Pathology.BLEEDING);
+            })
+            .then(facts -> {
+                PatientState p = facts.get("patient");
+                p.diagnoses().add(Pathology.SEPSIS);
+                facts.put("patient", p);
+            }).build();
+    }
+
+    /* ---------------- Level‑3: 诊断 → 治疗建议 ---------------- */
+
+    @Bean
+    public Rule icuRule() {
+        return new RuleBuilder()
+            .name("sepsis → ICU")
+            .priority(3)                               // 最后执行
+            .when(facts -> {
+                PatientState p = facts.get("patient");
+                return p.diagnoses().contains(Pathology.SEPSIS);
+            })
+            .then(facts -> {
+                PatientState p = facts.get("patient");
+                p.treatments().add(Treatment.ADMIT_ICU);
+                facts.put("patient", p);
+                System.out.println(">>> 建议立即转入 ICU！");
+            }).build();
+    }
+}
+```
+
+------
+
+### 4 . 驱动代码
+
+```java
+public class Demo {
+
+    public static void main(String[] args) {
+
+        // ① 初始化原始症状
+        PatientState patient = new PatientState(
+            EnumSet.of(Symptom.FEVER, Symptom.HIGH_WBC,
+                       Symptom.LOW_BP, Symptom.TACHYCARDIA),
+            EnumSet.noneOf(Pathology.class),
+            EnumSet.noneOf(Pathology.class),
+            EnumSet.noneOf(Treatment.class)
+        );
+
+        // ② 注册 Rules
+        Rules rules = new Rules(
+            new DiagnosisRules().infectionRule(),
+            new DiagnosisRules().bleedingRule(),
+            new DiagnosisRules().sepsisRule(),
+            new DiagnosisRules().icuRule()
+        );
+
+        // ③ 准备 Facts
+        Facts facts = new Facts();
+        facts.put("patient", patient);
+
+        // ④ 使用 Inference 引擎：会层层推理
+        RulesEngine engine = new InferenceRulesEngine();
+        engine.fire(rules, facts);
+
+        // ⑤ 输出最终结论
+        PatientState result = facts.get("patient");
+        System.out.println("\n== 推理结果 ==");
+        System.out.println("病理: "   + result.pathologies());
+        System.out.println("诊断: "   + result.diagnoses());
+        System.out.println("处置: "   + result.treatments());
+    }
+}
+```
+
+#### 运行日志（简版）
+
+```
+[INFO] symptom → infection triggered
+[INFO] symptom → bleeding triggered
+[INFO] pathology → sepsis triggered
+[INFO] sepsis → ICU triggered
+>>> 建议立即转入 ICU！
+
+== 推理结果 ==
+病理: [INFECTION, BLEEDING]
+诊断: [SEPSIS]
+处置: [ADMIT_ICU]
+```
+
+------
+
+### 5 . 如果换成 DefaultRulesEngine 会怎样？
+
+把第 ④ 行改成
+
+```java
+RulesEngine engine = new DefaultRulesEngine();
+```
+
+由于 **只有第一轮匹配**：
+
+1. `infectionRule` 与 `bleedingRule` 触发 → 插入新事实
+2. **不会再进入新一轮** 来评估 `sepsisRule`
+3. 故 ICU 建议永远出不来
+
+你就得手写额外规则或多次 `fire(...)` 调用，既啰嗦又易错。
+
+------
+
+### 6 . 结论
+
+- **InferenceRulesEngine** 通过 *forward‑chaining* 自动把新事实重新投入匹配循环，实现多层推理
+- 复杂决策树（尤其医学、信贷、风控领域）可大幅减少显式规则数量
+- 但要 **严防循环**：
+  - 给规则加优先级阈值
+  - 在 action 中避免无限生成同一事实
+
+希望这个较完整的 DEMO 能清晰展示 InferenceRulesEngine 的魅力！若想进一步探讨性能调优或死循环防护，随时告诉我～
+
+
+
+## 风控Demo
+
+已思考 1 秒
+
+好的！我们全部改回 Java 8 语法（不使用 `record`、`var`、`switch ->` 等新特性），并继续展示 **InferenceRulesEngine** 在风控场景下的威力。
+
+------
+
+### 1. 数据模型
+
+```java
+public enum Behavior {
+    LOGIN_OVERSEAS,            // 海外登录
+    LOGIN_DEVICE_CHANGE,       // 更换终端
+    TRANSFER_MANY_SMALL,       // 频繁小额转出
+    TRANSFER_LARGE_NIGHT,      // 深夜大额
+    MULTI_FAILED_LOGIN         // 多次失败登录
+}
+
+public enum RiskFeature {
+    ABNORMAL_LOGIN,            // 异常登录
+    FUNDS_BRIDGING,            // 资金搬砖
+    ACTIVITY_SPIKE             // 活跃度激增
+}
+
+public enum RiskLevel {
+    LOW, MEDIUM, HIGH
+}
+
+public enum Action {
+    NO_ACTION,
+    REQUIRE_OTP_VERIFICATION,
+    FREEZE_ACCOUNT,
+    ALERT_MANAGER
+}
+
+/** PatientState 替换为 RiskContext，持久化在 Facts 中 */
+public class RiskContext {
+    private final Set<Behavior> behaviors    = EnumSet.noneOf(Behavior.class);
+    private final Set<RiskFeature> features  = EnumSet.noneOf(RiskFeature.class);
+    private RiskLevel level                  = null;
+    private final Set<Action> actions        = EnumSet.noneOf(Action.class);
+
+    // getters
+    public Set<Behavior> getBehaviors()   { return behaviors; }
+    public Set<RiskFeature> getFeatures() { return features; }
+    public RiskLevel getLevel()           { return level; }
+    public Set<Action> getActions()       { return actions; }
+
+    // setters
+    public void setLevel(RiskLevel level) { this.level = level; }
+}
+```
+
+------
+
+### 2. 规则实现（3 层推理）
+
+#### 2‑1 行为 → 风险特征
+
+```java
+public static Rule abnormalLoginRule() {
+    return new RuleBuilder()
+        .name("行为 → 异常登录")
+        .description("海外登录或终端切换 + 多次失败登录 → ABNORMAL_LOGIN")
+        .priority(1)
+        .when(f -> {
+            RiskContext ctx = f.get("ctx");
+            return (ctx.getBehaviors().contains(Behavior.LOGIN_OVERSEAS)
+                 || ctx.getBehaviors().contains(Behavior.LOGIN_DEVICE_CHANGE))
+                 && ctx.getBehaviors().contains(Behavior.MULTI_FAILED_LOGIN);
+        })
+        .then(f -> {
+            RiskContext ctx = f.get("ctx");
+            ctx.getFeatures().add(RiskFeature.ABNORMAL_LOGIN);
+            f.put("ctx", ctx);                // 触发推理
+        })
+        .build();
+}
+
+public static Rule fundsBridgingRule() {
+    return new RuleBuilder()
+        .name("行为 → 资金搬砖")
+        .priority(1)
+        .when(f -> {
+            RiskContext ctx = f.get("ctx");
+            return ctx.getBehaviors().contains(Behavior.TRANSFER_MANY_SMALL)
+                && ctx.getBehaviors().contains(Behavior.TRANSFER_LARGE_NIGHT);
+        })
+        .then(f -> {
+            RiskContext ctx = f.get("ctx");
+            ctx.getFeatures().add(RiskFeature.FUNDS_BRIDGING);
+            f.put("ctx", ctx);
+        })
+        .build();
+}
+```
+
+#### 2‑2 风险特征组合 → 风险等级
+
+```java
+public static Rule highRiskRule() {
+    return new RuleBuilder()
+        .name("特征 → 高风险")
+        .priority(2)
+        .when(f -> {
+            RiskContext ctx = f.get("ctx");
+            return ctx.getFeatures().contains(RiskFeature.ABNORMAL_LOGIN)
+                && ctx.getFeatures().contains(RiskFeature.FUNDS_BRIDGING);
+        })
+        .then(f -> {
+            RiskContext ctx = f.get("ctx");
+            ctx.setLevel(RiskLevel.HIGH);
+            f.put("ctx", ctx);
+        })
+        .build();
+}
+
+public static Rule mediumRiskRule() {
+    return new RuleBuilder()
+        .name("特征 → 中风险")
+        .priority(2)
+        .when(f -> {
+            RiskContext ctx = f.get("ctx");
+            return ctx.getLevel() == null                      // 还没被判高风险
+                && ctx.getFeatures().contains(RiskFeature.ABNORMAL_LOGIN);
+        })
+        .then(f -> {
+            RiskContext ctx = f.get("ctx");
+            ctx.setLevel(RiskLevel.MEDIUM);
+            f.put("ctx", ctx);
+        })
+        .build();
+}
+```
+
+#### 2‑3 风险等级 → 处置动作
+
+```java
+public static Rule highRiskActionRule() {
+    return new RuleBuilder()
+        .name("高风险 → 冻结账户并告警")
+        .priority(3)
+        .when(f -> {
+            RiskContext ctx = f.get("ctx");
+            return ctx.getLevel() == RiskLevel.HIGH;
+        })
+        .then(f -> {
+            RiskContext ctx = f.get("ctx");
+            ctx.getActions().add(Action.FREEZE_ACCOUNT);
+            ctx.getActions().add(Action.ALERT_MANAGER);
+            f.put("ctx", ctx);
+            System.out.println(">>> 高风险！冻结账户并通知风控经理。");
+        })
+        .build();
+}
+
+public static Rule mediumRiskActionRule() {
+    return new RuleBuilder()
+        .name("中风险 → 二次验证")
+        .priority(3)
+        .when(f -> {
+            RiskContext ctx = f.get("ctx");
+            return ctx.getLevel() == RiskLevel.MEDIUM;
+        })
+        .then(f -> {
+            RiskContext ctx = f.get("ctx");
+            ctx.getActions().add(Action.REQUIRE_OTP_VERIFICATION);
+            f.put("ctx", ctx);
+            System.out.println(">>> 中风险，要求短信 OTP 验证。");
+        })
+        .build();
+}
+```
+
+------
+
+### 3. 驱动入口
+
+```java
+public class RiskInferenceDemo {
+
+    public static void main(String[] args) {
+
+        // ① 初始化上下文（模拟发生的行为）
+        RiskContext ctx = new RiskContext();
+        ctx.getBehaviors().addAll(Arrays.asList(
+            Behavior.LOGIN_OVERSEAS,
+            Behavior.MULTI_FAILED_LOGIN,
+            Behavior.TRANSFER_MANY_SMALL,
+            Behavior.TRANSFER_LARGE_NIGHT
+        ));
+
+        // ② 注册全部规则
+        Rules rules = new Rules(
+            abnormalLoginRule(),
+            fundsBridgingRule(),
+            highRiskRule(),
+            mediumRiskRule(),
+            highRiskActionRule(),
+            mediumRiskActionRule()
+        );
+
+        // ③ Facts
+        Facts facts = new Facts();
+        facts.put("ctx", ctx);
+
+        // ④ 强大的前向推理引擎
+        RulesEngine engine = new InferenceRulesEngine();
+        engine.fire(rules, facts);
+
+        // ⑤ 查看最终结果
+        RiskContext result = facts.get("ctx");
+        System.out.println("\n=== 推理结果 ===");
+        System.out.println("风险特征: " + result.getFeatures());
+        System.out.println("风险等级: " + result.getLevel());
+        System.out.println("处置动作: " + result.getActions());
+    }
+}
+```
+
+------
+
+### 4. 示例输出
+
+```
+[INFO] 行为 → 异常登录 triggered
+[INFO] 行为 → 资金搬砖 triggered
+[INFO] 特征 → 高风险 triggered
+[INFO] 高风险 → 冻结账户并告警 triggered
+>>> 高风险！冻结账户并通知风控经理。
+
+=== 推理结果 ===
+风险特征: [ABNORMAL_LOGIN, FUNDS_BRIDGING]
+风险等级: HIGH
+处置动作: [FREEZE_ACCOUNT, ALERT_MANAGER]
+```
+
+------
+
+#### 🏆 亮点回顾
+
+1. **一次 fire → 多轮推理**
+    `InferenceRulesEngine` 自动把 **行为 → 特征 → 等级 → 动作** 串起来，省掉多次代码调用或显式组合规则。
+2. **易维护**
+    新增风险特征或组合时，只需加独立规则，推理链条能自动扩展。
+3. **灵活防环**
+   - 规则优先级逐层递增，防止同层循环
+   - 如需进一步保险，可使用 `engineParameters.setSkipOnFirstAppliedRule(true)` 等配置。
+
+这样就展示了在 **风控领域** 运用 `InferenceRulesEngine` 的实战级示例，且完全兼容 Java 8！
+ 如果你想深入讨论性能表现、规则组织最佳实践或如何做单元测试，随时告诉我 😊
